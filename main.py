@@ -4,10 +4,10 @@ import json
 import subprocess
 import threading
 from datetime import datetime
-from telegram import Update, File
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
-    MessageHandler, ContextTypes, filters
+    MessageHandler, filters, ContextTypes
 )
 
 # ================= AYARLAR =================
@@ -67,7 +67,6 @@ def bot_calistir(hedef, filepath):
             with open(logpath, "a") as log:
                 log.write(f"\n=== Başlatıldı {datetime.now()} ===\n")
                 try:
-                    # requirements.txt varsa kur
                     req = os.path.join(os.path.dirname(filepath), "requirements.txt")
                     if os.path.exists(req):
                         subprocess.run(
@@ -87,7 +86,7 @@ def bot_calistir(hedef, filepath):
 
     threading.Thread(target=run, daemon=True).start()
 
-# ================= KOMUTLAR (AYNI) =================
+# ================= KOMUTLAR =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     sira, toplam = kullanici_ekle(user, context)
@@ -106,7 +105,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/durum → Botun Durumu ℹ️\n"
         "/log @kullanici → Log (Admin)\n"
         "/liste → Üyeler (Admin)\n\n"
-        "✈️ Telegram :BOT SAHİBİ @zordodestek |YETKİLİ @mutluapk"
+        "✈️ Telegram :bot sahibi @zordodestek |  yetkili @mutluapk"
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -120,7 +119,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = f"{hedef}_{doc.file_name}"
     path = os.path.join(UPLOAD_DIR, filename)
 
-    file: File = await context.bot.get_file(doc.file_id)
+    file = await context.bot.get_file(doc.file_id)
     await file.download_to_drive(path)
 
     bot_calistir(hedef, path)
@@ -132,7 +131,7 @@ async def aktifet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hedef = str(user.username or user.id)
 
     dosyalar = sorted(
-        [f for f in os.listdir(UPLOAD_DIR) if f.startswith(hedef)],
+        [f for f in os.listdir(UPLOAD_DIR) if f.startswith(hedef + "_")],
         reverse=True
     )
 
@@ -189,17 +188,53 @@ async def liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg)
 
-# ================= MAIN =================
+# ================= WEBHOOK SETUP =================
+async def main():
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("aktifet", aktifet))
+    application.add_handler(CommandHandler("kapat", kapat))
+    application.add_handler(CommandHandler("durum", durum))
+    application.add_handler(CommandHandler("log", log))
+    application.add_handler(CommandHandler("liste", liste))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Render'dan gelen PORT'u al (genelde 10000 olur)
+    port = int(os.environ.get("PORT", "8443"))
+
+    # Render'ın sana verdiği domain (otomatik environment variable)
+    # Örnek: https://zordo-bot.onrender.com
+    external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not external_hostname:
+        print("UYARI: RENDER_EXTERNAL_HOSTNAME environment variable bulunamadı!")
+        return
+
+    webhook_url = f"https://{external_hostname}/{TOKEN}"
+
+    await application.initialize()
+    await application.start()
+
+    await application.bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True  # deploy sonrası biriken mesajları at
+    )
+
+    print(f"🚀 Webhook ayarlandı: {webhook_url}")
+    print("Render Web Service olarak çalışıyor – polling kullanılmıyor")
+
+    # Webhook sunucusunu başlat (python-telegram-bot kendi tornado sunucusunu kullanır)
+    await application.updater.start_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,               # güvenlik için token'ı path'e koyduk
+        webhook_url=webhook_url
+    )
+
+    # Botu sonsuza kadar çalıştır
+    await application.updater.wait_for_stop()
+
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("aktifet", aktifet))
-    app.add_handler(CommandHandler("kapat", kapat))
-    app.add_handler(CommandHandler("durum", durum))
-    app.add_handler(CommandHandler("log", log))
-    app.add_handler(CommandHandler("liste", liste))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    print("🚀 Bot Render Free'de çalışıyor")
-    app.run_polling()
+    import asyncio
+    asyncio.run(main())
