@@ -3,15 +3,22 @@ import sys
 import json
 import subprocess
 import threading
+import asyncio
+import time
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, filters, ContextTypes,
+    Application
 )
+from telegram.error import RetryAfter, TelegramError
 
 # ================= AYARLAR =================
 TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable eksik! Render'da ekle.")
+
 ADMIN_ID = 8444268448
 
 UPLOAD_DIR = "gelen_dosyalar"
@@ -36,7 +43,7 @@ def save_users(data):
     with open(KAYITLAR, "w") as f:
         json.dump(data, f, indent=2)
 
-def kullanici_ekle(user, context=None):
+def kullanici_ekle(user, context: ContextTypes.DEFAULT_TYPE = None):
     data = load_users()
     uid = str(user.id)
 
@@ -49,17 +56,17 @@ def kullanici_ekle(user, context=None):
         save_users(data)
 
         if context:
-            context.bot.send_message(
+            asyncio.create_task(context.bot.send_message(
                 ADMIN_ID,
                 f"🆕 Yeni Kullanıcı\n"
                 f"👤 @{user.username or user.id}\n"
                 f"📊 Toplam Kullanıcı: {len(data)}"
-            )
+            ))
 
     return data[uid]["sira"], len(data)
 
 # ================= BOT ÇALIŞTIR =================
-def bot_calistir(hedef, filepath):
+def bot_calistir(hedef: str, filepath: str):
     logpath = os.path.join(LOG_DIR, f"{hedef}.txt")
 
     def run():
@@ -82,7 +89,9 @@ def bot_calistir(hedef, filepath):
                     aktif_prosesler[hedef] = proc
                     proc.wait()
                 except Exception as e:
-                    log.write(f"HATA: {e}\n")
+                    log.write(f"HATA: {str(e)}\n")
+                    log.flush()
+                    time.sleep(10)  # hata sonrası kısa bekle
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -90,22 +99,19 @@ def bot_calistir(hedef, filepath):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     sira, toplam = kullanici_ekle(user, context)
-
     await update.message.reply_text(
-        f"ZORDO Vds Botuna Hosgeldin 🖥️\n"
+        f"ZORDO Vds Botuna Hoşgeldin 🖥️\n"
         f"@{user.username or user.id}!\n"
-        f"Bu Botta Sıra #{sira}.sin\n\n"
-        f"👥 Toplam Kullanıcı: {toplam}\n\n"
-        "Nasıl Kullanır❓\n"
-        "🚀 .py Bot Alt Yapısını Gönder\n"
-        "🚀 Paketler otomatik kurulur\n\n"
-        "📜Komutlar:\n"
-        "/aktifet → Botunu Aktif Et 🟢\n"
-        "/kapat → Botunu Durdur 🔴\n"
-        "/durum → Botun Durumu ℹ️\n"
-        "/log @kullanici → Log (Admin)\n"
-        "/liste → Üyeler (Admin)\n\n"
-        "✈️ Telegram :bot sahibi @zordodestek |  yetkili @mutluapk"
+        f"Sıra: #{sira} / Toplam: {toplam}\n\n"
+        "Nasıl Kullanılır?\n"
+        "→ .py dosyasını buraya gönder\n"
+        "→ Paketler otomatik kurulur\n\n"
+        "Komutlar:\n"
+        "/aktifet → Botu çalıştır\n"
+        "/kapat → Durdur\n"
+        "/durum → Durum kontrol\n"
+        "/log → Logları gör (admin)\n"
+        "/liste → Kullanıcı listesi (admin)"
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,40 +119,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hedef = str(user.username or user.id)
 
     doc = update.message.document
-    if not doc.file_name.endswith(".py"):
-        return await update.message.reply_text("⚠️ Sadece .py dosyası")
+    if not doc or not doc.file_name.lower().endswith(".py"):
+        await update.message.reply_text("⚠️ Sadece .py dosyası kabul ediyorum")
+        return
 
     filename = f"{hedef}_{doc.file_name}"
     path = os.path.join(UPLOAD_DIR, filename)
 
-    file = await context.bot.get_file(doc.file_id)
+    file = await doc.get_file()
     await file.download_to_drive(path)
 
     bot_calistir(hedef, path)
-
-    await update.message.reply_text("✅ Bot aktif edildi")
+    await update.message.reply_text(f"✅ {doc.file_name} yüklendi ve çalıştırıldı")
 
 async def aktifet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     hedef = str(user.username or user.id)
 
-    dosyalar = sorted(
-        [f for f in os.listdir(UPLOAD_DIR) if f.startswith(hedef + "_")],
-        reverse=True
-    )
-
+    dosyalar = [f for f in os.listdir(UPLOAD_DIR) if f.startswith(hedef + "_") and f.endswith(".py")]
     if not dosyalar:
-        return await update.message.reply_text("Dosya bulunamadı")
+        await update.message.reply_text("❌ Hiç .py dosyan yok")
+        return
 
-    bot_calistir(hedef, os.path.join(UPLOAD_DIR, dosyalar[0]))
-    await update.message.reply_text("🚀 Bot çalıştırıldı")
+    en_yeni = max(dosyalar, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))
+    path = os.path.join(UPLOAD_DIR, en_yeni)
+
+    bot_calistir(hedef, path)
+    await update.message.reply_text("🚀 En son dosya çalıştırıldı")
 
 async def kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hedef = str(update.effective_user.username or update.effective_user.id)
     proc = aktif_prosesler.get(hedef)
-
     if proc and proc.poll() is None:
         proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except:
+            proc.kill()
         await update.message.reply_text("🛑 Bot durduruldu")
     else:
         await update.message.reply_text("Bot zaten kapalı")
@@ -154,41 +163,50 @@ async def kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def durum(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hedef = str(update.effective_user.username or update.effective_user.id)
     proc = aktif_prosesler.get(hedef)
+    durum_text = "🟢 Aktif" if proc and proc.poll() is None else "🔴 Kapalı"
+    await update.message.reply_text(f"Durum: {durum_text}")
 
-    if proc and proc.poll() is None:
-        await update.message.reply_text("🟢 Bot aktif")
-    else:
-        await update.message.reply_text("🔴 Bot çalışmıyor")
+# log ve liste komutlarını basit tuttum, istersen genişletebilirsin
 
 async def log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    hedef = str(user.username or user.id)
-
-    if context.args and user.id == ADMIN_ID:
-        hedef = context.args[0].lstrip("@")
-
+    if update.effective_user.id != ADMIN_ID:
+        return await update.message.reply_text("Yetkisiz")
+    hedef = context.args[0].lstrip("@") if context.args else str(update.effective_user.username or update.effective_user.id)
     logf = os.path.join(LOG_DIR, f"{hedef}.txt")
     if not os.path.exists(logf):
-        return await update.message.reply_text("Log yok")
-
+        return await update.message.reply_text("Log dosyası yok")
     with open(logf, "r") as f:
-        txt = f.read()[-1200:]
-
+        txt = f.read()[-2000:]
     await update.message.reply_text(f"```\n{txt}\n```", parse_mode="Markdown")
 
 async def liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     data = load_users()
-    msg = "👥 Üyeler\n\n"
-
-    for uid, v in data.items():
-        msg += f"#{v['sira']} → @{v['username'] or uid}\n"
-
-    await update.message.reply_text(msg)
+    msg = "Kullanıcılar:\n"
+    for uid, v in sorted(data.items(), key=lambda x: x[1]["sira"]):
+        msg += f"#{v['sira']} - @{v['username'] or uid} ({v['time']})\n"
+    await update.message.reply_text(msg or "Henüz kullanıcı yok")
 
 # ================= WEBHOOK SETUP =================
+async def set_webhook_with_retry(bot, webhook_url, max_retries=4):
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            return True
+        except RetryAfter as e:
+            print(f"Flood → {e.retry_after} sn bekleniyor (deneme {attempt})")
+            await asyncio.sleep(e.retry_after + 1.5)
+        except TelegramError as e:
+            print(f"Webhook hatası: {e}")
+            await asyncio.sleep(3)
+    print("Webhook set edilemedi – max deneme aşıldı")
+    return False
+
 async def main():
     application = ApplicationBuilder().token(TOKEN).build()
 
@@ -200,41 +218,46 @@ async def main():
     application.add_handler(CommandHandler("liste", liste))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Render'dan gelen PORT'u al (genelde 10000 olur)
-    port = int(os.environ.get("PORT", "8443"))
-
-    # Render'ın sana verdiği domain (otomatik environment variable)
-    # Örnek: https://zordo-bot.onrender.com
-    external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    if not external_hostname:
-        print("UYARI: RENDER_EXTERNAL_HOSTNAME environment variable bulunamadı!")
+    port = int(os.environ.get("PORT", 8443))
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not hostname:
+        print("HATA: RENDER_EXTERNAL_HOSTNAME yok – Render Web Service mi?")
         return
 
-    webhook_url = f"https://{external_hostname}/{TOKEN}"
+    webhook_path = f"/{TOKEN}"
+    webhook_url = f"https://{hostname}{webhook_path}"
+
+    print(f"Webhook hedef URL: {webhook_url}")
+    print(f"Port: {port}")
 
     await application.initialize()
     await application.start()
 
-    await application.bot.set_webhook(
-        url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True  # deploy sonrası biriken mesajları at
-    )
+    # Mevcut webhook kontrolü – flood'u önler
+    try:
+        current = await application.bot.get_webhook_info()
+        if current.url == webhook_url:
+            print("Webhook zaten doğru ayarlı – tekrar set ETMEYİ atlıyoruz")
+        else:
+            print("Webhook farklı / yok → set ediliyor...")
+            success = await set_webhook_with_retry(application.bot, webhook_url)
+            if success:
+                print("Webhook başarıyla ayarlandı!")
+            else:
+                print("Webhook ayarlanamadı – logları kontrol et")
+    except Exception as e:
+        print(f"Webhook kontrol/set hatası: {e}")
 
-    print(f"🚀 Webhook ayarlandı: {webhook_url}")
-    print("Render Web Service olarak çalışıyor – polling kullanılmıyor")
-
-    # Webhook sunucusunu başlat (python-telegram-bot kendi tornado sunucusunu kullanır)
     await application.updater.start_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=TOKEN,               # güvenlik için token'ı path'e koyduk
-        webhook_url=webhook_url
+        url_path=webhook_path,
+        webhook_url=webhook_url,
+        drop_pending_updates=True
     )
 
-    # Botu sonsuza kadar çalıştır
-    await application.updater.wait_for_stop()
+    print("Webhook sunucusu başladı – Render'da hazır")
+    await asyncio.Event().wait()  # Botu açık tut
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
