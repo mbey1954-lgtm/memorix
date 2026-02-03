@@ -1,170 +1,119 @@
-import os
-import sys
-import json
-import subprocess
-import threading
-import asyncio
-import time
+# ================= TEMEL =================
+import os, sys, json, time, asyncio, subprocess, threading, signal
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
-    MessageHandler, filters, ContextTypes,
-    Application
+    MessageHandler, ContextTypes, filters
 )
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import RetryAfter
 
-# ================= AYARLAR =================
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("BOT_TOKEN environment variable eksik! Render'da ekle.")
+    raise SystemExit("BOT_TOKEN eksik")
 
-ADMIN_ID = 8444268448
+ADMIN_ID = 8444268448  # ❗ İLK KODDAN AYNEN ALINDI
 
 UPLOAD_DIR = "gelen_dosyalar"
 LOG_DIR = "loglar"
-KAYITLAR = "kullanicilar.json"
+USERS_FILE = "kullanicilar.json"
+BAN_FILE = "banli.json"
+
+MAX_SURE = 3600        # 1 saat
+MAX_RESTART = 3
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-if not os.path.exists(KAYITLAR):
-    with open(KAYITLAR, "w") as f:
-        json.dump({}, f)
+for f in [USERS_FILE, BAN_FILE]:
+    if not os.path.exists(f):
+        json.dump({}, open(f, "w"))
 
-aktif_prosesler = {}  # hedef → {"proc": Popen, "baslangic_zamani": float}
+aktif_prosesler = {}
 
-# ================= KULLANICI VERİLERİ =================
-def load_users():
-    with open(KAYITLAR, "r") as f:
-        data = json.load(f)
-        for uid in data:
-            if "toplam_sure_saniye" not in data[uid]:
-                data[uid]["toplam_sure_saniye"] = 0
-        return data
+# ================= JSON =================
+def load(p): return json.load(open(p))
+def save(p, d): json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
 
-def save_users(data):
-    with open(KAYITLAR, "w") as f:
-        json.dump(data, f, indent=2)
-
-def kullanici_ekle(user, context=None):
-    data = load_users()
+# ================= USER =================
+def user_add(user):
+    d = load(USERS_FILE)
     uid = str(user.id)
-
-    if uid not in data:
-        data[uid] = {
+    if uid not in d:
+        d[uid] = {
             "username": user.username,
-            "sira": len(data) + 1,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "toplam_sure_saniye": 0
+            "toplam": 0,
+            "kayit": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
-        save_users(data)
+        save(USERS_FILE, d)
 
-        if context:
-            asyncio.create_task(context.bot.send_message(
-                ADMIN_ID,
-                f"🆕 Yeni Kullanıcı\n"
-                f"👤 @{user.username or user.id}\n"
-                f"📊 Toplam Kullanıcı: {len(data)}"
-            ))
+def banli(uid):
+    return str(uid) in load(BAN_FILE)
 
-    return data[uid]["sira"], len(data)
+# ================= BOT ÇALIŞTIR =================
+def run_bot(owner, path):
+    if owner in aktif_prosesler:
+        return False
 
-def en_cok_calisan_kullanici():
-    data = load_users()
-    if not data:
-        return "Henüz kimse yok", "0 sn"
+    logpath = f"{LOG_DIR}/{owner}.txt"
+    restarts = 0
 
-    en_iyi_uid, en_iyi_veri = max(
-        data.items(),
-        key=lambda x: x[1].get("toplam_sure_saniye", 0)
-    )
-
-    username = f"@{en_iyi_veri['username']}" if en_iyi_veri['username'] else f"ID:{en_iyi_uid}"
-    toplam_s = en_iyi_veri["toplam_sure_saniye"]
-
-    saat = toplam_s // 3600
-    dk = (toplam_s % 3600) // 60
-    sn = toplam_s % 60
-
-    return username, f"{saat}s {dk}d {sn}sn"
-
-# ================= BOT ÇALIŞTIRMA =================
-def bot_calistir(hedef: str, filepath: str):
-    logpath = os.path.join(LOG_DIR, f"{hedef}.txt")
-
-    aktif_prosesler[hedef] = {
-        "proc": None,
-        "baslangic_zamani": time.time()
-    }
-
-    def run():
-        while True:
+    def runner():
+        nonlocal restarts
+        while restarts < MAX_RESTART:
+            start = time.time()
             with open(logpath, "a", encoding="utf-8") as log:
-                log.write(f"\n=== Başlatıldı {datetime.now()} ===\n")
-                log.flush()
+                log.write(f"\n[{datetime.now()}] BAŞLADI\n")
 
                 try:
-                    # requirements.txt varsa kur
-                    req_path = os.path.join(os.path.dirname(filepath), "requirements.txt")
-                    if os.path.exists(req_path):
-                        log.write("requirements.txt bulundu → paketler kuruluyor...\n")
-                        result = subprocess.run(
-                            [sys.executable, "-m", "pip", "install", "-r", req_path],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            timeout=240
+                    req = os.path.join(os.path.dirname(path), "requirements.txt")
+                    if os.path.exists(req):
+                        subprocess.run(
+                            [sys.executable, "-m", "pip", "install", "-r", req],
+                            stdout=log, stderr=log
                         )
-                        log.write(result.stdout + "\n")
-                        if result.stderr:
-                            log.write("HATA (pip):\n" + result.stderr + "\n")
-                        log.write(f"pip return code: {result.returncode}\n")
 
-                    # Botu çalıştır
-                    log.write(f"python {filepath} başlatılıyor...\n")
                     proc = subprocess.Popen(
-                        [sys.executable, filepath],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        bufsize=1
+                        [sys.executable, path],
+                        stdout=log, stderr=log
                     )
-                    aktif_prosesler[hedef]["proc"] = proc
 
-                    # Canlı log akışı
-                    def stream_log(pipe, tag):
-                        for line in iter(pipe.readline, ''):
-                            log.write(f"{tag} {line.strip()}\n")
-                            log.flush()
+                    aktif_prosesler[owner] = {
+                        "proc": proc,
+                        "start": start
+                    }
 
-                    threading.Thread(target=stream_log, args=(proc.stdout, "[OUT]"), daemon=True).start()
-                    threading.Thread(target=stream_log, args=(proc.stderr, "[ERR]"), daemon=True).start()
+                    while proc.poll() is None:
+                        if time.time() - start > MAX_SURE:
+                            proc.terminate()
+                            log.write("⏱ Süre doldu\n")
+                            break
+                        time.sleep(2)
 
-                    proc.wait()
-                    log.write(f"Bot bitti (code: {proc.returncode})\n")
+                    log.write(f"ÇIKIŞ KODU: {proc.returncode}\n")
 
                 except Exception as e:
-                    log.write(f"ÇALIŞTIRMA HATASI: {type(e).__name__}: {str(e)}\n")
-                finally:
-                    log.flush()
-                    time.sleep(5)
+                    log.write(f"HATA: {e}\n")
 
-    threading.Thread(target=run, daemon=True).start()
+            restarts += 1
+            time.sleep(5)
 
-# ================= START MESAJI (tam senin istediğin format) =================
+        aktif_prosesler.pop(owner, None)
+
+    threading.Thread(target=runner, daemon=True).start()
+    return True
+
+# ================= KOMUTLAR =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    sira, toplam = kullanici_ekle(user, context)
+    if banli(user.id):
+        return
 
-    username_display = f"@{user.username}" if user.username else f"ID:{user.id}"
-    birinci, sure = en_cok_calisan_kullanici()
+    user_add(user)
 
-    mesaj = f"""Bu Botta Sıra #{sira}.sin {username_display}
+    mesaj = f"""Bu Botta Sıra #{user.id}
 
 İyi Kullanımlar🥳
-
-🏆 Birinci: {birinci} ({sure})
 
 Nasıl Kullanır❓
 🚀 .py Bot Alt Yapınızı Gönderin.
@@ -181,132 +130,92 @@ Nasıl Kullanır❓
 
     await update.message.reply_text(mesaj)
 
-# ================= DİĞER KOMUTLAR (kısaca) =================
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def upload(update: Update, context):
     user = update.effective_user
-    hedef = str(user.username or user.id)
+    if banli(user.id):
+        return
 
     doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".py"):
-        await update.message.reply_text("Sadece .py dosyası kabul ediyorum")
-        return
+    if not doc or not doc.file_name.endswith(".py"):
+        return await update.message.reply_text("❌ Sadece .py")
 
-    filename = f"{hedef}_{doc.file_name}"
-    path = os.path.join(UPLOAD_DIR, filename)
+    owner = str(user.id)
+    path = f"{UPLOAD_DIR}/{owner}_{doc.file_name}"
+    await (await doc.get_file()).download_to_drive(path)
 
-    file = await doc.get_file()
-    await file.download_to_drive(path)
+    ok = run_bot(owner, path)
+    await update.message.reply_text("✅ Çalıştırıldı" if ok else "⚠️ Zaten aktif botun var")
 
-    bot_calistir(hedef, path)
-    await update.message.reply_text(f"✅ {doc.file_name} yüklendi ve başlatıldı\nLog: /log")
+async def aktifet(update: Update, context):
+    owner = str(update.effective_user.id)
+    if owner in aktif_prosesler:
+        return await update.message.reply_text("🟢 Zaten aktif")
 
-async def aktifet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    hedef = str(user.username or user.id)
+    files = [f for f in os.listdir(UPLOAD_DIR) if f.startswith(owner)]
+    if not files:
+        return await update.message.reply_text("Dosya yok")
 
-    dosyalar = [f for f in os.listdir(UPLOAD_DIR) if f.startswith(hedef + "_") and f.endswith(".py")]
-    if not dosyalar:
-        await update.message.reply_text("Hiç .py dosyan yok")
-        return
+    run_bot(owner, f"{UPLOAD_DIR}/{files[-1]}")
+    await update.message.reply_text("🚀 Aktif edildi")
 
-    en_yeni = max(dosyalar, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))
-    path = os.path.join(UPLOAD_DIR, en_yeni)
+async def kapat(update: Update, context):
+    owner = str(update.effective_user.id)
+    if owner not in aktif_prosesler:
+        return await update.message.reply_text("Zaten kapalı")
 
-    bot_calistir(hedef, path)
-    await update.message.reply_text("🚀 En son dosya çalıştırıldı\nLog: /log")
+    p = aktif_prosesler[owner]["proc"]
+    p.terminate()
 
-async def kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hedef = str(update.effective_user.username or update.effective_user.id)
+    sure = int(time.time() - aktif_prosesler[owner]["start"])
+    users = load(USERS_FILE)
+    users[owner]["toplam"] += sure
+    save(USERS_FILE, users)
 
-    if hedef not in aktif_prosesler:
-        await update.message.reply_text("Bot zaten kapalı")
-        return
+    aktif_prosesler.pop(owner, None)
+    await update.message.reply_text("🛑 Bot durduruldu")
 
-    info = aktif_prosesler[hedef]
-    proc = info.get("proc")
-    baslangic = info.get("baslangic_zamani", 0)
+async def durum(update: Update, context):
+    owner = str(update.effective_user.id)
+    await update.message.reply_text("🟢 Aktif" if owner in aktif_prosesler else "🔴 Kapalı")
 
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except:
-            proc.kill()
-
-        gecen = int(time.time() - baslangic)
-        data = load_users()
-        uid = hedef
-        if uid in data:
-            data[uid]["toplam_sure_saniye"] = data[uid].get("toplam_sure_saniye", 0) + gecen
-            save_users(data)
-
-        del aktif_prosesler[hedef]
-        await update.message.reply_text("🛑 Bot durduruldu")
-    else:
-        await update.message.reply_text("Bot zaten kapalı")
-
-async def durum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hedef = str(update.effective_user.username or update.effective_user.id)
-    if hedef in aktif_prosesler and aktif_prosesler[hedef].get("proc") and aktif_prosesler[hedef]["proc"].poll() is None:
-        await update.message.reply_text("🟢 Bot aktif")
-    else:
-        await update.message.reply_text("🔴 Bot çalışmıyor")
-
-async def log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def log(update: Update, context):
     if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("Yetkisiz")
-    hedef = context.args[0].lstrip("@") if context.args else str(update.effective_user.username or update.effective_user.id)
-    logf = os.path.join(LOG_DIR, f"{hedef}.txt")
-    if not os.path.exists(logf):
-        return await update.message.reply_text("Log dosyası yok")
-    with open(logf, "r", encoding="utf-8") as f:
-        txt = f.read()[-4000:]
+        return
+
+    hedef = context.args[0].lstrip("@") if context.args else str(update.effective_user.id)
+    lf = f"{LOG_DIR}/{hedef}.txt"
+    if not os.path.exists(lf):
+        return await update.message.reply_text("Log yok")
+
+    txt = open(lf, encoding="utf-8").read()[-4000:]
     await update.message.reply_text(f"```\n{txt}\n```", parse_mode="Markdown")
 
-# ... diğer komutlar (liste vs.) aynı kalabilir
+async def liste(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    users = load(USERS_FILE)
+    msg = "👤 Kullanıcılar:\n"
+    for u in users:
+        msg += f"- {u}\n"
+    await update.message.reply_text(msg)
 
-# ================= WEBHOOK SETUP (önceki stabil hali) =================
-# (buraya önceki mesajdaki webhook main fonksiyonunu koyabilirsin, değişmedi)
-
+# ================= MAIN =================
 async def main():
-    application = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("aktifet", aktifet))
-    application.add_handler(CommandHandler("kapat", kapat))
-    application.add_handler(CommandHandler("durum", durum))
-    application.add_handler(CommandHandler("log", log))
-    # application.add_handler(CommandHandler("liste", liste))  # varsa ekle
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("aktifet", aktifet))
+    app.add_handler(CommandHandler("kapat", kapat))
+    app.add_handler(CommandHandler("durum", durum))
+    app.add_handler(CommandHandler("log", log))
+    app.add_handler(CommandHandler("liste", liste))
+    app.add_handler(MessageHandler(filters.Document.ALL, upload))
 
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # webhook kısmı önceki mesajdaki gibi (set_webhook_with_retry vs.)
-
-    # ... (webhook başlatma kodunu buraya yapıştır)
-
-if __name__ == "__main__":
-    asyncio.run(main()).url == webhook_url:
-            print("Webhook zaten doğru ayarlı – tekrar set ETMEYİ atlıyoruz")
-        else:
-            print("Webhook farklı / yok → set ediliyor...")
-            success = await set_webhook_with_retry(application.bot, webhook_url)
-            if success:
-                print("Webhook başarıyla ayarlandı!")
-            else:
-                print("Webhook ayarlanamadı – logları kontrol et")
-    except Exception as e:
-        print(f"Webhook kontrol/set hatası: {e}")
-
-    await application.updater.start_webhook(
+    await app.run_webhook(
         listen="0.0.0.0",
-        port=port,
-        url_path=webhook_path,
-        webhook_url=webhook_url,
-        drop_pending_updates=True
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}"
     )
-
-    print("Webhook sunucusu başladı – Render'da hazır")
-    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
