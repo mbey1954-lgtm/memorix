@@ -32,18 +32,23 @@ if not os.path.exists(KAYITLAR):
     with open(KAYITLAR, "w") as f:
         json.dump({}, f)
 
-aktif_prosesler = {}
+aktif_prosesler = {}  # {hedef: {"proc": process, "baslangic_zamani": float}}
 
-# ================= KULLANICI =================
+# ================= KULLANICI VERİLERİ =================
 def load_users():
     with open(KAYITLAR, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+        # Eski kayıtlara toplam_sure_saniye ekle (bir kereye mahsus)
+        for uid in data:
+            if "toplam_sure_saniye" not in data[uid]:
+                data[uid]["toplam_sure_saniye"] = 0
+        return data
 
 def save_users(data):
     with open(KAYITLAR, "w") as f:
         json.dump(data, f, indent=2)
 
-def kullanici_ekle(user, context: ContextTypes.DEFAULT_TYPE = None):
+def kullanici_ekle(user, context=None):
     data = load_users()
     uid = str(user.id)
 
@@ -51,7 +56,8 @@ def kullanici_ekle(user, context: ContextTypes.DEFAULT_TYPE = None):
         data[uid] = {
             "username": user.username,
             "sira": len(data) + 1,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "toplam_sure_saniye": 0
         }
         save_users(data)
 
@@ -65,9 +71,37 @@ def kullanici_ekle(user, context: ContextTypes.DEFAULT_TYPE = None):
 
     return data[uid]["sira"], len(data)
 
-# ================= BOT ÇALIŞTIR =================
+# ================= EN ÇOK ÇALIŞAN KULLANICIYI BUL =================
+def en_cok_calisan():
+    data = load_users()
+    if not data:
+        return "Henüz kimse yok", "0 sn"
+
+    en_iyi_uid = max(
+        data.items(),
+        key=lambda item: item[1].get("toplam_sure_saniye", 0)
+    )[0]
+
+    info = data[en_iyi_uid]
+    username = f"@{info['username']}" if info['username'] else f"ID:{en_iyi_uid}"
+    toplam_saniye = info["toplam_sure_saniye"]
+
+    saat = toplam_saniye // 3600
+    dakika = (toplam_saniye % 3600) // 60
+    saniye = toplam_saniye % 60
+
+    sure_yazi = f"{saat} saat {dakika} dk {saniye} sn"
+    return username, sure_yazi
+
+# ================= BOT ÇALIŞTIRMA =================
 def bot_calistir(hedef: str, filepath: str):
     logpath = os.path.join(LOG_DIR, f"{hedef}.txt")
+
+    # Başlangıç zamanını kaydet
+    aktif_prosesler[hedef] = {
+        "proc": None,
+        "baslangic_zamani": time.time()
+    }
 
     def run():
         while True:
@@ -86,12 +120,12 @@ def bot_calistir(hedef: str, filepath: str):
                         stdout=log,
                         stderr=log
                     )
-                    aktif_prosesler[hedef] = proc
+                    aktif_prosesler[hedef]["proc"] = proc
                     proc.wait()
                 except Exception as e:
                     log.write(f"HATA: {str(e)}\n")
                     log.flush()
-                    time.sleep(10)  # hata sonrası kısa bekle
+                    time.sleep(10)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -99,20 +133,31 @@ def bot_calistir(hedef: str, filepath: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     sira, toplam = kullanici_ekle(user, context)
-    await update.message.reply_text(
-        f"ZORDO Vds Botuna Hoşgeldin 🖥️\n"
-        f"@{user.username or user.id}!\n"
-        f"Sıra: #{sira} / Toplam: {toplam}\n\n"
-        "Nasıl Kullanılır?\n"
-        "→ .py dosyasını buraya gönder\n"
-        "→ Paketler otomatik kurulur\n\n"
-        "Komutlar:\n"
-        "/aktifet → Botu çalıştır\n"
-        "/kapat → Durdur\n"
-        "/durum → Durum kontrol\n"
-        "/log → Logları gör (admin)\n"
-        "/liste → Kullanıcı listesi (admin)"
-    )
+
+    username_display = f"@{user.username}" if user.username else f"ID:{user.id}"
+
+    birinci, sure = en_cok_calisan()
+
+    mesaj = f"""Bu Botta Sıra #{sira}.sin {username_display}
+İyi Kullanımlar🥳
+
+🏆 Birinci: {birinci}  
+   ({sure})
+
+Nasıl Kullanır❓
+🚀 .py Bot Alt Yapınızı Gönderin.
+🚀 Eksik paketler otomatik kurulacak ve bot çalışacak.
+
+📜Komutlar : 
+/aktifet → Botunu Aktif Et 🟢
+/kapat → Botunu Durdur 🔴
+/durum → Botun Durumu ℹ️
+/log @kullanici → Başkasının Logu (Admin) 🕸️
+/liste → Üyeler (Admin) 👤
+
+✈️Telegram : bot sahibi @zordodestek | yetkili @mutluapk ✈️"""
+
+    await update.message.reply_text(mesaj)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -149,24 +194,42 @@ async def aktifet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hedef = str(update.effective_user.username or update.effective_user.id)
-    proc = aktif_prosesler.get(hedef)
+
+    if hedef not in aktif_prosesler:
+        await update.message.reply_text("Bot zaten kapalı veya hiç başlatılmamış")
+        return
+
+    info = aktif_prosesler[hedef]
+    proc = info.get("proc")
+    baslangic = info.get("baslangic_zamani", 0)
+
     if proc and proc.poll() is None:
         proc.terminate()
         try:
             proc.wait(timeout=8)
         except:
             proc.kill()
+
+        # Süreyi kaydet
+        gecen = int(time.time() - baslangic)
+        data = load_users()
+        uid = hedef
+        if uid in data:
+            data[uid]["toplam_sure_saniye"] = data[uid].get("toplam_sure_saniye", 0) + gecen
+            save_users(data)
+
+        del aktif_prosesler[hedef]
+
         await update.message.reply_text("🛑 Bot durduruldu")
     else:
         await update.message.reply_text("Bot zaten kapalı")
 
 async def durum(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hedef = str(update.effective_user.username or update.effective_user.id)
-    proc = aktif_prosesler.get(hedef)
-    durum_text = "🟢 Aktif" if proc and proc.poll() is None else "🔴 Kapalı"
-    await update.message.reply_text(f"Durum: {durum_text}")
-
-# log ve liste komutlarını basit tuttum, istersen genişletebilirsin
+    if hedef in aktif_prosesler and aktif_prosesler[hedef]["proc"] and aktif_prosesler[hedef]["proc"].poll() is None:
+        await update.message.reply_text("🟢 Bot aktif")
+    else:
+        await update.message.reply_text("🔴 Bot çalışmıyor")
 
 async def log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -183,10 +246,10 @@ async def liste(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     data = load_users()
-    msg = "Kullanıcılar:\n"
+    msg = "👥 Üyeler\n\n"
     for uid, v in sorted(data.items(), key=lambda x: x[1]["sira"]):
-        msg += f"#{v['sira']} - @{v['username'] or uid} ({v['time']})\n"
-    await update.message.reply_text(msg or "Henüz kullanıcı yok")
+        msg += f"#{v['sira']} → @{v['username'] or uid} ({v['time']})\n"
+    await update.message.reply_text(msg)
 
 # ================= WEBHOOK SETUP =================
 async def set_webhook_with_retry(bot, webhook_url, max_retries=4):
@@ -233,7 +296,6 @@ async def main():
     await application.initialize()
     await application.start()
 
-    # Mevcut webhook kontrolü – flood'u önler
     try:
         current = await application.bot.get_webhook_info()
         if current.url == webhook_url:
@@ -257,7 +319,7 @@ async def main():
     )
 
     print("Webhook sunucusu başladı – Render'da hazır")
-    await asyncio.Event().wait()  # Botu açık tut
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
