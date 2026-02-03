@@ -1,4 +1,4 @@
-# ================= TEMEL =================
+# ===================== AYARLAR =====================
 import os, sys, json, time, asyncio, subprocess, threading, signal
 from datetime import datetime
 from telegram import Update
@@ -123,7 +123,7 @@ Nasıl Kullanır❓
 /aktifet → Botunu Aktif Et 🟢
 /kapat → Botunu Durdur 🔴
 /durum → Botun Durumu ℹ️
-/log @kullanici → Başkasının Logu (Admin) 🕸️
+/	log @kullanici → Başkasının Logu (Admin) 🕸️
 /liste → Üyeler (Admin) 👤
 
 ✈️Telegram : bot sahibi @zordodestek | yetkili @mutluapk ✈️"""
