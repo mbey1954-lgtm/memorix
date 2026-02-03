@@ -1,18 +1,19 @@
-# ===================== AYARLAR =====================
-import os, sys, json, time, asyncio, subprocess, threading, signal
+# ===================== KÜTÜPHANELER =====================
+import os, sys, json, time, asyncio, subprocess, threading
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
-    MessageHandler, ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 from telegram.error import RetryAfter
 
+# ===================== AYARLAR =====================
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("BOT_TOKEN eksik")
 
-ADMIN_ID = 8444268448  # ❗ İLK KODDAN AYNEN ALINDI
+ADMIN_ID = 8444268448  # ❗ ADMIN_ID
 
 UPLOAD_DIR = "gelen_dosyalar"
 LOG_DIR = "loglar"
@@ -25,17 +26,18 @@ MAX_RESTART = 3
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Veritabanı dosyalarını kontrol et
 for f in [USERS_FILE, BAN_FILE]:
     if not os.path.exists(f):
         json.dump({}, open(f, "w"))
 
 aktif_prosesler = {}
 
-# ================= JSON =================
+# ===================== JSON İŞLEMLERİ =====================
 def load(p): return json.load(open(p))
 def save(p, d): json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
 
-# ================= USER =================
+# ===================== KULLANICI İŞLEMLERİ =====================
 def user_add(user):
     d = load(USERS_FILE)
     uid = str(user.id)
@@ -50,7 +52,7 @@ def user_add(user):
 def banli(uid):
     return str(uid) in load(BAN_FILE)
 
-# ================= BOT ÇALIŞTIR =================
+# ===================== BOT ÇALIŞTIRMA =====================
 def run_bot(owner, path):
     if owner in aktif_prosesler:
         return False
@@ -103,7 +105,7 @@ def run_bot(owner, path):
     threading.Thread(target=runner, daemon=True).start()
     return True
 
-# ================= KOMUTLAR =================
+# ===================== TELEGRAM KOMUTLARI =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if banli(user.id):
@@ -199,7 +201,7 @@ async def liste(update: Update, context):
         msg += f"- {u}\n"
     await update.message.reply_text(msg)
 
-# ================= MAIN =================
+# ===================== MAIN =====================
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
